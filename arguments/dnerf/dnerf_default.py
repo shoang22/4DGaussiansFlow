@@ -12,8 +12,8 @@ OptimizationParams = dict(
     pruning_interval = 8000,
     percent_dense = 0.01,
     render_process=False,
-    # no_do=False,
-    # no_dshs=False
+    no_do=False,
+    no_dshs=False
     
     # opacity_reset_interval=30000
 

@@ -122,7 +122,6 @@ class OptimizationParams(ParamGroup):
         self.deformation_lr_delay_mult = 0.01
         self.grid_lr_init = 0.0016
         self.grid_lr_final = 0.00016
-
         self.feature_lr = 0.0025
         self.opacity_lr = 0.05
         self.scaling_lr = 0.005
@@ -147,6 +146,7 @@ class OptimizationParams(ParamGroup):
         self.opacity_threshold_fine_after = 0.005
         self.batch_size=1
         self.add_point=False
+        self.flow_loss_weight = 0.5
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

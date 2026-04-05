@@ -13,15 +13,232 @@ import torch
 import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
+from scene.deformation import poc_fre 
+from scene.utils import Camera
 from utils.sh_utils import eval_sh
 from time import time as get_time
+
+
+def deform(viewpoint_camera, pc : GaussianModel, means3D, scales, rotations, opacity, shs, cam_type=None, ):
+    # TODO: modify the signature such that if the deformation is provided, then it 
+    # doesn't need to be computed by the deformation network.
+
+    # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
+    screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
+    try:
+        screenspace_points.retain_grad()
+    except:
+        pass
+
+    # Set up rasterization configuration
+    
+    if cam_type != "PanopticSports":
+        time = torch.tensor(viewpoint_camera.time).to(means3D.device).repeat(means3D.shape[0],1)
+    else:
+        time=torch.tensor(viewpoint_camera['time']).to(means3D.device).repeat(means3D.shape[0],1)
+    
+    # opacity is derived from the viewpoint -> dont need to parametrize it for now
+    # TODO: see if opacity is useful
+
+    # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
+    # scaling / rotation by the rasterizer.
+    # scales = None
+    # rotations = None
+    # cov3D_precomp = None
+    # if pipe.compute_cov3D_python:
+    #     cov3D_precomp = pc.get_covariance(scaling_modifier)
+    # else:
+    deformation_point = pc._deformation_table
+    dx, ds, dr, do, dshs = pc._deformation(means3D, scales, rotations, opacity, shs, time, return_delta=True)
+
+    # TODO: move logic to calculate final params from deformer network to render()
+    # also, move logic to return coarse stage values from here to train() 
+
+    # time2 = get_time()
+    # print("asset value:",time2-time1)
+
+    return dx, ds, dr, do, dshs
+
+
+def final_from_deformation_delta(viewpoint_camera, pc: GaussianModel, dx, ds, dr, do, dshs, stage):
+    """
+    Calculate the final parameters from the deformation delta.
+    Only supports COLMAP
+    """
+    means3D = pc.get_xyz
+    opacity = pc._opacity
+    shs = pc.get_features
+
+    scales = pc._scaling
+    rotations = pc._rotation
+    time = torch.tensor(viewpoint_camera.time).to(means3D.device).repeat(means3D.shape[0],1)
+
+    if "coarse" in stage:
+        means3D_final, scales_final, rotations_final, opacity_final, shs_final = means3D, scales, rotations, opacity, shs
+
+    elif "fine" in stage:
+        dnet = pc._deformation
+        dnetmod = dnet.deformation_net
+
+        point_emb = poc_fre(means3D,dnet.pos_poc)
+        scales_emb = poc_fre(scales,dnet.rotation_scaling_poc)
+        rotations_emb = poc_fre(rotations,dnet.rotation_scaling_poc)
+        hidden = dnetmod.query_time(point_emb, scales_emb, rotations_emb, None, time)
+
+        if dnetmod.args.static_mlp:
+            mask = dnetmod.static_mlp(hidden)
+        elif dnetmod.args.empty_voxel:
+            mask = dnetmod.empty_voxel(point_emb[:,:3])
+        else:
+            mask = torch.ones_like(opacity[:,0]).unsqueeze(-1)
+
+        means3D_final = means3D[:,:3] * mask + dx
+        scales_final = scales_emb[:,:3]*mask + ds
+        rotations_final = rotations_emb[:,:4] + dr
+        opacity_final = opacity[:,:1]*mask + do
+        shs_final = shs*mask.unsqueeze(-1) + dshs
+    else:
+        raise NotImplementedError
+    
+    scales_final = pc.scaling_activation(scales_final)
+    rotations_final = pc.rotation_activation(rotations_final)
+    opacity_final = pc.opacity_activation(opacity_final)
+
+    return means3D_final, scales_final, rotations_final, opacity_final, shs_final
+
+# def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, d_xyz, d_rotation, d_scaling, is_6dof=False,
+#            scaling_modifier=1.0, override_color=None):
+def render_flow(
+    viewpoint_camera, 
+    pc : GaussianModel, 
+    xyz, 
+    rotations, 
+    scales,
+    opacity,
+    shs,
+    pipe, 
+    bg_color : torch.Tensor, 
+    scaling_modifier = 1.0, 
+    override_color = None, 
+    cam_type=None
+):
+    """
+    Render the scene. 
+    
+    Background tensor (bg_color) must be on GPU!
+    """
+    # TODO: modify the signature such that if the deformation is provided, then it 
+    # doesn't need to be computed by the deformation network.
+
+    # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
+    screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
+    try:
+        screenspace_points.retain_grad()
+    except:
+        pass
+
+    # Set up rasterization configuration
+    if cam_type != "PanopticSports":
+        tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+        tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+        raster_settings = GaussianRasterizationSettings(
+            image_height=int(viewpoint_camera.image_height),
+            image_width=int(viewpoint_camera.image_width),
+            tanfovx=tanfovx,
+            tanfovy=tanfovy,
+            bg=bg_color,
+            scale_modifier=scaling_modifier,
+            viewmatrix=viewpoint_camera.world_view_transform.cuda(),
+            projmatrix=viewpoint_camera.full_proj_transform.cuda(),
+            sh_degree=pc.active_sh_degree,
+            campos=viewpoint_camera.camera_center.cuda(),
+            prefiltered=False,
+            debug=pipe.debug
+        )
+    else:
+        raster_settings = viewpoint_camera['camera']
+
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+    means2D = screenspace_points
+    
+    colors_precomp = None
+    if override_color is None:
+        if pipe.convert_SHs_python:
+            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
+            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.cuda().repeat(pc.get_features.shape[0], 1))
+            dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
+            sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
+            colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
+        else:
+            pass
+            # shs = 
+    else:
+        colors_precomp = override_color
+
+    # Rasterize visible Gaussians to image, obtain their radii (on screen). 
+    # time3 = get_time()
+    rendered_image, radii, depth, alpha, proj_2D, conic_2D, conic_2D_inv, gs_per_pixel, weight_per_gs_pixel, x_mu = rasterizer(
+        means3D = xyz,
+        means2D = means2D,
+        shs = shs,
+        colors_precomp = colors_precomp,
+        opacities = opacity,
+        scales = scales,
+        rotations = rotations,
+        cov3D_precomp = None)
+    # time4 = get_time()
+    # print("rasterization:",time4-time3)
+    # breakpoint()
+    # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
+    # They will be excluded from value updates used in the splitting criteria.
+    return {"render": rendered_image,
+            "viewspace_points": screenspace_points,
+            "visibility_filter": radii > 0,
+            "radii": radii,
+            "depth": depth,
+            "alpha": alpha,
+            "proj_2D": proj_2D,
+            "conic_2D": conic_2D,
+            "conic_2D_inv": conic_2D_inv,
+            "gs_per_pixel": gs_per_pixel,
+            "weight_per_gs_pixel": weight_per_gs_pixel,
+            "x_mu": x_mu
+            }
+
+
+def render_helper(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, scaling_modifier = 1.0, override_color = None, stage="fine", cam_type=None):
+    means3D = pc.get_xyz
+    opacity = pc._opacity
+    shs = pc.get_features
+    scales = pc._scaling
+    rotations = pc._rotation
+    dx, ds, dr, do, dshs = deform(viewpoint_camera=viewpoint_camera, pc=pc, means3D=means3D, opacity=opacity, scales=scales, rotations=rotations, shs=shs, cam_type=cam_type)
+    means3D_final, scales_final, rotations_final, opacity_final, shs_final = final_from_deformation_delta(viewpoint_camera=viewpoint_camera, pc=pc, dx=dx, ds=ds, dr=dr, do=do, dshs=dshs, stage=stage)
+    return render_flow(
+        viewpoint_camera, 
+        pc=pc, 
+        xyz=means3D_final, 
+        rotations=rotations_final, 
+        scales=scales_final,
+        opacity=opacity_final,
+        shs=shs_final,
+        pipe=pipe, 
+        bg_color=bg_color, 
+        scaling_modifier=scaling_modifier, 
+        override_color=override_color, 
+        cam_type=cam_type
+    )
+
+
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, stage="fine", cam_type=None):
     """
     Render the scene. 
     
     Background tensor (bg_color) must be on GPU!
     """
- 
+    # TODO: modify the signature such that if the deformation is provided, then it 
+    # doesn't need to be computed by the deformation network.
+
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
     try:
@@ -60,7 +277,6 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # means3D = pc.get_xyz
     # add deformation to each points
     # deformation = pc.get_deformation
-
     
     means2D = screenspace_points
     opacity = pc._opacity
@@ -89,8 +305,6 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                                                                  time)
     else:
         raise NotImplementedError
-
-
 
     # time2 = get_time()
     # print("asset value:",time2-time1)

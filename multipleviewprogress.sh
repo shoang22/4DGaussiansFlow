@@ -20,8 +20,8 @@ python LLFF/imgs2poses.py ./colmap_tmp/
 
 cp ./colmap_tmp/poses_bounds.npy ./data/multipleview/$workdir/poses_bounds_multipleview.npy
 
-rm -rf ./colmap_tmp
-rm -rf ./LLFF
+# rm -rf ./colmap_tmp
+# rm -rf ./LLFF
 
 
 

@@ -9,3 +9,6 @@ screenshots
 data/
 data
 submodules/
+pretrained_models/
+colmap_tmp/
+**/checkpoints/

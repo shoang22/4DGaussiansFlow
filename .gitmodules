@@ -8,3 +8,6 @@
 [submodule "SIBR_viewers"]
 	path = SIBR_viewers
 	url = https://gitlab.inria.fr/sibr/sibr_core
+[submodule "submodules/flow-diff-gaussian-rasterization"]
+	path = submodules/flow-diff-gaussian-rasterization
+	url = https://github.com/Zerg-Overmind/diff-gaussian-rasterization.git
