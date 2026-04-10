@@ -1,5 +1,5 @@
-DATASET ?= background1-4dgs-jpg
-PORT ?= 6018
+DATASET ?= background1-4dgs-og
+PORT ?= 6021
 
 train:
 	python train.py -s data/multipleview/$(DATASET) --port $(PORT) --expname "multipleview/$(DATASET)" --configs arguments/multipleview/default.py 

@@ -153,7 +153,7 @@ class Deformation(nn.Module):
                 raise ValueError("self.args.no_do cannot be True if return_delta is set to True")
             if self.args.no_dshs:
                 raise ValueError("self.args.no_dshs cannot be True if return_delta is set to True")
-            return dx, ds, dr, do, dshs
+            return dx, ds, dr, do, dshs, mask
 
         return pts, scales, rotations, opacity, shs
     def get_mlp_parameters(self):
@@ -212,7 +212,7 @@ class deform_network(nn.Module):
         rotations_emb = poc_fre(rotations,self.rotation_scaling_poc)
         # time_emb = poc_fre(times_sel, self.time_poc)
         # times_feature = self.timenet(time_emb)
-        means3D, scales, rotations, opacity, shs = self.deformation_net( point_emb,
+        result = self.deformation_net( point_emb,
                                                   scales_emb,
                                                 rotations_emb,
                                                 opacity,
@@ -220,6 +220,10 @@ class deform_network(nn.Module):
                                                 None,
                                                 times_sel,
                                                 return_delta=return_delta)
+        if return_delta:
+            dx, ds, dr, do, dshs, mask = result
+            return dx, ds, dr, do, dshs, mask, scales_emb, rotations_emb
+        means3D, scales, rotations, opacity, shs = result
         return means3D, scales, rotations, opacity, shs
     def get_mlp_parameters(self):
         return self.deformation_net.get_mlp_parameters() + list(self.timenet.parameters())
