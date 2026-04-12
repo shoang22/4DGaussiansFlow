@@ -48,36 +48,6 @@ def getWorld2View2(R, t, translate=np.array([.0, .0, .0]), scale=1.0):
     Rt = np.linalg.inv(C2W)
     return np.float32(Rt)
 
-
-def getExtrinsicMatrix(R, t):
-    Rt = np.zeros((4, 4))
-    Rt[:3, :3] = R.transpose()
-    Rt[:3, 3] = t
-    Rt[3, 3] = 1.0
-    Rt = np.linalg.inv(Rt)
-
-    return np.float32(Rt)
-
-
-def getIntrinsicMatrix(width, height, fovX, fovY):
-    tanHalfFovY = math.tan((fovY / 2))
-    tanHalfFovX = math.tan((fovX / 2))
-
-    cx = width / 2
-    cy = height / 2
-    fx = cx / tanHalfFovX
-    fy = cy / tanHalfFovY
-
-    K = torch.eye(4, 4)
-
-    K[0, 0] = fx
-    K[1, 1] = fy
-    K[0, 2] = cx
-    K[1, 2] = cy
-
-    return K
-
-
 def getProjectionMatrix(znear, zfar, fovX, fovY):
     tanHalfFovY = math.tan((fovY / 2))
     tanHalfFovX = math.tan((fovX / 2))

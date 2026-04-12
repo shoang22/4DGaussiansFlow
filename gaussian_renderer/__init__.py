@@ -20,6 +20,9 @@ from time import time as get_time
 
 
 def deform(viewpoint_camera, pc : GaussianModel, means3D, scales, rotations, opacity, shs, cam_type=None, ):
+    # TODO: modify the signature such that if the deformation is provided, then it 
+    # doesn't need to be computed by the deformation network.
+
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
     try:
@@ -46,19 +49,21 @@ def deform(viewpoint_camera, pc : GaussianModel, means3D, scales, rotations, opa
     #     cov3D_precomp = pc.get_covariance(scaling_modifier)
     # else:
     deformation_point = pc._deformation_table
-    dx, ds, dr, do, dshs, mask, scales_emb, rotations_emb = pc._deformation(means3D, scales, rotations, opacity, shs, time, return_delta=True)
+    dx, ds, dr, do, dshs = pc._deformation(means3D, scales, rotations, opacity, shs, time, return_delta=True)
+
+    # TODO: move logic to calculate final params from deformer network to render()
+    # also, move logic to return coarse stage values from here to train() 
 
     # time2 = get_time()
     # print("asset value:",time2-time1)
 
-    return dx, ds, dr, do, dshs, mask, scales_emb, rotations_emb
+    return dx, ds, dr, do, dshs
 
 
-def final_from_deformation_delta(viewpoint_camera, pc: GaussianModel, dx, ds, dr, do, dshs, stage, precomputed=None):
+def final_from_deformation_delta(viewpoint_camera, pc: GaussianModel, dx, ds, dr, do, dshs, stage):
     """
     Calculate the final parameters from the deformation delta.
-    Only supports COLMAP.
-    precomputed: optional tuple (mask, scales_emb, rotations_emb) from deform() to skip redundant query_time calls.
+    Only supports COLMAP
     """
     means3D = pc.get_xyz
     opacity = pc._opacity
@@ -66,29 +71,26 @@ def final_from_deformation_delta(viewpoint_camera, pc: GaussianModel, dx, ds, dr
 
     scales = pc._scaling
     rotations = pc._rotation
+    time = torch.tensor(viewpoint_camera.time).to(means3D.device).repeat(means3D.shape[0],1)
 
     if "coarse" in stage:
         means3D_final, scales_final, rotations_final, opacity_final, shs_final = means3D, scales, rotations, opacity, shs
 
     elif "fine" in stage:
-        if precomputed is not None:
-            mask, scales_emb, rotations_emb = precomputed
+        dnet = pc._deformation
+        dnetmod = dnet.deformation_net
+
+        point_emb = poc_fre(means3D,dnet.pos_poc)
+        scales_emb = poc_fre(scales,dnet.rotation_scaling_poc)
+        rotations_emb = poc_fre(rotations,dnet.rotation_scaling_poc)
+        hidden = dnetmod.query_time(point_emb, scales_emb, rotations_emb, None, time)
+
+        if dnetmod.args.static_mlp:
+            mask = dnetmod.static_mlp(hidden)
+        elif dnetmod.args.empty_voxel:
+            mask = dnetmod.empty_voxel(point_emb[:,:3])
         else:
-            time = torch.tensor(viewpoint_camera.time).to(means3D.device).repeat(means3D.shape[0],1)
-            dnet = pc._deformation
-            dnetmod = dnet.deformation_net
-
-            point_emb = poc_fre(means3D,dnet.pos_poc)
-            scales_emb = poc_fre(scales,dnet.rotation_scaling_poc)
-            rotations_emb = poc_fre(rotations,dnet.rotation_scaling_poc)
-            hidden = dnetmod.query_time(point_emb, scales_emb, rotations_emb, None, time)
-
-            if dnetmod.args.static_mlp:
-                mask = dnetmod.static_mlp(hidden)
-            elif dnetmod.args.empty_voxel:
-                mask = dnetmod.empty_voxel(point_emb[:,:3])
-            else:
-                mask = torch.ones_like(opacity[:,0]).unsqueeze(-1)
+            mask = torch.ones_like(opacity[:,0]).unsqueeze(-1)
 
         means3D_final = means3D[:,:3] * mask + dx
         scales_final = scales_emb[:,:3]*mask + ds
@@ -125,6 +127,9 @@ def render_flow(
     
     Background tensor (bg_color) must be on GPU!
     """
+    # TODO: modify the signature such that if the deformation is provided, then it 
+    # doesn't need to be computed by the deformation network.
+
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
     try:
@@ -207,8 +212,8 @@ def render_helper(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Ten
     shs = pc.get_features
     scales = pc._scaling
     rotations = pc._rotation
-    dx, ds, dr, do, dshs, mask, scales_emb, rotations_emb = deform(viewpoint_camera=viewpoint_camera, pc=pc, means3D=means3D, opacity=opacity, scales=scales, rotations=rotations, shs=shs, cam_type=cam_type)
-    means3D_final, scales_final, rotations_final, opacity_final, shs_final = final_from_deformation_delta(viewpoint_camera=viewpoint_camera, pc=pc, dx=dx, ds=ds, dr=dr, do=do, dshs=dshs, stage=stage, precomputed=(mask, scales_emb, rotations_emb))
+    dx, ds, dr, do, dshs = deform(viewpoint_camera=viewpoint_camera, pc=pc, means3D=means3D, opacity=opacity, scales=scales, rotations=rotations, shs=shs, cam_type=cam_type)
+    means3D_final, scales_final, rotations_final, opacity_final, shs_final = final_from_deformation_delta(viewpoint_camera=viewpoint_camera, pc=pc, dx=dx, ds=ds, dr=dr, do=do, dshs=dshs, stage=stage)
     return render_flow(
         viewpoint_camera, 
         pc=pc, 
@@ -231,6 +236,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     
     Background tensor (bg_color) must be on GPU!
     """
+    # TODO: modify the signature such that if the deformation is provided, then it 
+    # doesn't need to be computed by the deformation network.
+
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
     try:
