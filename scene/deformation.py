@@ -84,20 +84,17 @@ class Deformation(nn.Module):
     @property
     def get_empty_ratio(self):
         return self.ratio
-    def forward(self, rays_pts_emb, scales_emb=None, rotations_emb=None, opacity = None,shs_emb=None, time_feature=None, time_emb=None, return_delta=False):
+    def forward(self, rays_pts_emb, scales_emb=None, rotations_emb=None, opacity = None,shs_emb=None, time_feature=None, time_emb=None):
         if time_emb is None:
             return self.forward_static(rays_pts_emb[:,:3])
         else:
-            return self.forward_dynamic(rays_pts_emb, scales_emb, rotations_emb, opacity, shs_emb, time_feature, time_emb, return_delta=return_delta)
+            return self.forward_dynamic(rays_pts_emb, scales_emb, rotations_emb, opacity, shs_emb, time_feature, time_emb)
 
-    def forward_static(self, rays_pts_emb, return_delta=False):
+    def forward_static(self, rays_pts_emb):
         grid_feature = self.grid(rays_pts_emb[:,:3])
         dx = self.static_mlp(grid_feature)
-        if return_delta: 
-            return dx
         return rays_pts_emb[:, :3] + dx
-    def forward_dynamic(self,rays_pts_emb, scales_emb, rotations_emb, opacity_emb, shs_emb, time_feature, time_emb, return_delta=False):
-        # delta is calculated and added here
+    def forward_dynamic(self,rays_pts_emb, scales_emb, rotations_emb, opacity_emb, shs_emb, time_feature, time_emb):
         hidden = self.query_time(rays_pts_emb, scales_emb, rotations_emb, time_feature, time_emb)
         if self.args.static_mlp:
             mask = self.static_mlp(hidden)
@@ -148,13 +145,6 @@ class Deformation(nn.Module):
             # breakpoint()
             shs = shs_emb*mask.unsqueeze(-1) + dshs
 
-        if return_delta:
-            if self.args.no_do:
-                raise ValueError("self.args.no_do cannot be True if return_delta is set to True")
-            if self.args.no_dshs:
-                raise ValueError("self.args.no_dshs cannot be True if return_delta is set to True")
-            return dx, ds, dr, do, dshs
-
         return pts, scales, rotations, opacity, shs
     def get_mlp_parameters(self):
         parameter_list = []
@@ -192,8 +182,8 @@ class deform_network(nn.Module):
         self.apply(initialize_weights)
         # print(self)
 
-    def forward(self, point, scales=None, rotations=None, opacity=None, shs=None, times_sel=None, return_delta=False):
-        return self.forward_dynamic(point, scales, rotations, opacity, shs, times_sel, return_delta=return_delta)
+    def forward(self, point, scales=None, rotations=None, opacity=None, shs=None, times_sel=None):
+        return self.forward_dynamic(point, scales, rotations, opacity, shs, times_sel)
     @property
     def get_aabb(self):
         
@@ -205,7 +195,7 @@ class deform_network(nn.Module):
     def forward_static(self, points):
         points = self.deformation_net(points)
         return points
-    def forward_dynamic(self, point, scales=None, rotations=None, opacity=None, shs=None, times_sel=None, return_delta=False):
+    def forward_dynamic(self, point, scales=None, rotations=None, opacity=None, shs=None, times_sel=None):
         # times_emb = poc_fre(times_sel, self.time_poc)
         point_emb = poc_fre(point,self.pos_poc)
         scales_emb = poc_fre(scales,self.rotation_scaling_poc)
@@ -218,8 +208,7 @@ class deform_network(nn.Module):
                                                 opacity,
                                                 shs,
                                                 None,
-                                                times_sel,
-                                                return_delta=return_delta)
+                                                times_sel)
         return means3D, scales, rotations, opacity, shs
     def get_mlp_parameters(self):
         return self.deformation_net.get_mlp_parameters() + list(self.timenet.parameters())

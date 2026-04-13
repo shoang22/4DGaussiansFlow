@@ -12,9 +12,9 @@ import numpy as np
 import random
 import os, sys
 import torch
-from random import gauss, randint
+from random import randint
 from utils.loss_utils import l1_loss, ssim, l2_loss, lpips_loss
-from gaussian_renderer import render, network_gui, render_flow, deform, final_from_deformation_delta, render_helper
+from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -26,13 +26,13 @@ from arguments import ModelParams, PipelineParams, OptimizationParams, ModelHidd
 from torch.utils.data import DataLoader
 from utils.timer import Timer
 from utils.loader_utils import FineSampler, get_stamp_list
+from utils.flow_utils import calculate_gs_flow, flow_loss
 import lpips
 from utils.scene_utils import render_training_image
-from utils.flow_utils import calculate_gs_flow, flow_loss
 from time import time
 import copy
 from gmflow.gmflow import build_gmflow
-from gmflow.config import get_cfg as get_gmflow_cfg 
+from gmflow.config import get_cfg as get_gmflow_cfg
 
 to8b = lambda x : (255*np.clip(x.cpu().numpy(),0,1)).astype(np.uint8)
 
@@ -43,8 +43,9 @@ except ImportError:
     TENSORBOARD_FOUND = False
 def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations, 
                          checkpoint_iterations, checkpoint, debug_from,
-                         gaussians: GaussianModel, scene, stage, tb_writer, train_iter,timer):
+                         gaussians, scene, stage, tb_writer, train_iter,timer):
     first_iter = 0
+
     gaussians.training_setup(opt)
     if checkpoint:
         # breakpoint()
@@ -118,32 +119,32 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                             # 
     count = 0
     for iteration in range(first_iter, final_iter+1):        
-        # if network_gui.conn == None:
-        #     network_gui.try_connect()
-        # while network_gui.conn != None:
-        #     try:
-        #         net_image_bytes = None
-        #         custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
-        #         if custom_cam != None:
-        #             count +=1
-        #             viewpoint_index = (count ) % len(video_cams)
-        #             if (count //(len(video_cams))) % 2 == 0:
-        #                 viewpoint_index = viewpoint_index
-        #             else:
-        #                 viewpoint_index = len(video_cams) - viewpoint_index - 1
-        #             # print(viewpoint_index)
-        #             viewpoint = video_cams[viewpoint_index]
-        #             custom_cam.time = viewpoint.time
-        #             # print(custom_cam.time, viewpoint_index, count)
-        #             net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer, stage=stage, cam_type=scene.dataset_type)["render"]
+        if network_gui.conn == None:
+            network_gui.try_connect()
+        while network_gui.conn != None:
+            try:
+                net_image_bytes = None
+                custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
+                if custom_cam != None:
+                    count +=1
+                    viewpoint_index = (count ) % len(video_cams)
+                    if (count //(len(video_cams))) % 2 == 0:
+                        viewpoint_index = viewpoint_index
+                    else:
+                        viewpoint_index = len(video_cams) - viewpoint_index - 1
+                    # print(viewpoint_index)
+                    viewpoint = video_cams[viewpoint_index]
+                    custom_cam.time = viewpoint.time
+                    # print(custom_cam.time, viewpoint_index, count)
+                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer, stage=stage, cam_type=scene.dataset_type)["render"]
 
-        #             net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
-        #         network_gui.send(net_image_bytes, dataset.source_path)
-        #         if do_training and ((iteration < int(opt.iterations)) or not keep_alive) :
-        #             break
-        #     except Exception as e:
-        #         print(e)
-        #         network_gui.conn = None
+                    net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
+                network_gui.send(net_image_bytes, dataset.source_path)
+                if do_training and ((iteration < int(opt.iterations)) or not keep_alive) :
+                    break
+            except Exception as e:
+                print(e)
+                network_gui.conn = None
 
         iter_start.record()
 
@@ -154,6 +155,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             gaussians.oneupSHdegree()
 
         # Pick a random Camera
+
         # dynerf's branch
         if opt.dataloader and not load_in_memory:
             try:
@@ -183,7 +185,6 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
-
         images = []
         gt_images = []
         radii_list = []
@@ -192,134 +193,25 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         viewpoint_cams = list(viewpoint_cams)
         viewpoint_cams1 = viewpoint_cams[::2]
         viewpoint_cams2 = viewpoint_cams[1::2]
+        loss = 0.0
         for i in range(len(viewpoint_cams) // 2):
             viewpoint_cam1 = viewpoint_cams1[i]
             viewpoint_cam2 = viewpoint_cams2[i]
-
-            means3D = gaussians.get_xyz
-            opacity = gaussians._opacity
-            shs = gaussians.get_features
-            scales = gaussians._scaling
-            rotations = gaussians._rotation
-            loss = 0 
-            if "coarse" in stage:
-                means3D_final, scales_final, rotations_final, opacity_final, shs_final = means3D, scales, rotations, opacity, shs
-                render_pkg = render_flow(
-                    viewpoint_camera=viewpoint_cam2, 
-                    pc=gaussians, 
-                    xyz=means3D_final,
-                    scales=scales_final,
-                    rotations=rotations_final,
-                    opacity=opacity_final,
-                    shs=shs_final,
-                    pipe=pipe, 
-                    bg_color=background, 
-                    cam_type=scene.dataset_type
-                )
-                image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-
-            elif "fine" in stage:
-                dx1, ds1, dr1, do1, dshs1 = deform(viewpoint_camera=viewpoint_cam1, pc=gaussians, means3D=means3D, scales=scales, rotations=rotations, opacity=opacity, shs=shs, cam_type=scene.dataset_type)
-                dx2, ds2, dr2, do2, dshs2 = deform(viewpoint_camera=viewpoint_cam2, pc=gaussians, means3D=means3D, scales=scales, rotations=rotations, opacity=opacity, shs=shs, cam_type=scene.dataset_type)
-                means3D_final1, scales_final1, rotations_final1, opacity_final1, shs_final1 = final_from_deformation_delta(
-                    viewpoint_camera=viewpoint_cam1, 
-                    pc=gaussians, 
-                    dx=dx1, 
-                    ds=ds1, 
-                    dr=dr1, 
-                    do=do1, 
-                    dshs=dshs1, 
-                    stage=stage, 
-                ) 
-                means3D_final2_1, scales_final2_1, rotations_final2_1, opacity_final2_1, shs_final2_1 = final_from_deformation_delta(
-                    viewpoint_camera=viewpoint_cam2, 
-                    pc=gaussians, 
-                    dx=dx1, 
-                    ds=ds1, 
-                    dr=dr1, 
-                    do=do1, 
-                    dshs=dshs1, 
-                    stage=stage, 
-                ) 
-                means3D_final2, scales_final2, rotations_final2, opacity_final2, shs_final2 = final_from_deformation_delta(
-                    viewpoint_camera=viewpoint_cam2, 
-                    pc=gaussians, 
-                    dx=dx2, 
-                    ds=ds2, 
-                    dr=dr2, 
-                    do=do2, 
-                    dshs=dshs2, 
-                    stage=stage, 
-                ) 
-                render_pkg1 = render_flow(
-                    viewpoint_camera=viewpoint_cam1, 
-                    pc=gaussians, 
-                    xyz=means3D_final1,
-                    scales=scales_final1,
-                    rotations=rotations_final1,
-                    opacity=opacity_final1,
-                    shs=shs_final1,
-                    pipe=pipe, 
-                    bg_color=background, 
-                    cam_type=scene.dataset_type
-                )
-                image, viewspace_point_tensor, visibility_filter, radii = render_pkg1["render"], render_pkg1["viewspace_points"], render_pkg1["visibility_filter"], render_pkg1["radii"]
-
-                render_pkg2_1 = render_flow(
-                    viewpoint_camera=viewpoint_cam2, 
-                    pc=gaussians, 
-                    xyz=means3D_final2_1,
-                    scales=scales_final2_1,
-                    rotations=rotations_final2_1,
-                    opacity=opacity_final2_1,
-                    shs=shs_final2_1,
-                    pipe=pipe, 
-                    bg_color=background, 
-                    cam_type=scene.dataset_type
-                )
-                alpha, proj_2D, conic_2D, conic_2D_inv, gs_per_pixel, weight_per_gs_pixel, x_mu = render_pkg2_1[
-                    "alpha"], render_pkg2_1["proj_2D"], render_pkg2_1["conic_2D"], render_pkg2_1["conic_2D_inv"
-                    ], render_pkg2_1["gs_per_pixel"], render_pkg2_1["weight_per_gs_pixel"], render_pkg2_1["x_mu"]         
-                
-                render_pkg2 = render_flow(
-                    viewpoint_camera=viewpoint_cam2, 
-                    pc=gaussians, 
-                    xyz=means3D_final2,
-                    scales=scales_final2,
-                    rotations=rotations_final2,
-                    opacity=opacity_final2,
-                    shs=shs_final2,
-                    pipe=pipe, 
-                    bg_color=background, 
-                    cam_type=scene.dataset_type
-                )
-                next_proj_2D, next_conic_2D = render_pkg2["proj_2D"], render_pkg2["conic_2D"] 
-                if hyper.time_smoothness_weight != 0:
-                    # tv_loss = 0
-                    tv_loss = gaussians.compute_regulation(hyper.time_smoothness_weight, hyper.l1_time_planes, hyper.plane_tv_weight)
-                    loss += tv_loss
-        
-                # warp gs_flow to match motion flow
-                gs_flow = calculate_gs_flow(gs_per_pixel, weight_per_gs_pixel, next_conic_2D, conic_2D_inv, proj_2D, next_proj_2D, x_mu)
-            
+            render_pkg = render(viewpoint_cam1, gaussians, pipe, background, stage=stage,cam_type=scene.dataset_type)
+            image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
             images.append(image.unsqueeze(0))
-
             if scene.dataset_type!="PanopticSports":
                 gt_image = viewpoint_cam1.original_image.cuda()
                 next_gt_image = viewpoint_cam2.original_image.cuda()
             else:
                 gt_image = viewpoint_cam1['image'].cuda()
                 next_gt_image = viewpoint_cam2['image'].cuda()
-                
+            
             H, W = gt_image.shape[-2:]
             gt_images.append(gt_image.unsqueeze(0))
             radii_list.append(radii.unsqueeze(0))
             visibility_filter_list.append(visibility_filter.unsqueeze(0))
             viewspace_point_tensor_list.append(viewspace_point_tensor)
-
-        if opt.lambda_dssim != 0:
-            ssim_loss = ssim(image_tensor,gt_image_tensor)
-            loss += opt.lambda_dssim * (1.0-ssim_loss)
 
         radii = torch.cat(radii_list,0).max(dim=0).values
         visibility_filter = torch.cat(visibility_filter_list).any(dim=0)
@@ -328,27 +220,50 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         # Loss
         # breakpoint()
         Ll1 = l1_loss(image_tensor, gt_image_tensor[:,:3,:,:])
-        loss += Ll1
+
         psnr_ = psnr(image_tensor, gt_image_tensor).mean().double()
         # norm
 
-        if stage == "fine":
-            with torch.no_grad():
-                # flow_forward_gt, former_backward_gt = process_optical_flow(flownet, next_gt_image, gt_image, H, W, H, W)
-                flow_2d_gt = flownet(gt_image[None]*255, next_gt_image[None]*255) # return flow_predictions, feat_s, feat_t
+        # H, W = gt_image.shape[-2:]
+        # if stage == "fine":
+        #     with torch.no_grad():
+        #         # flow_forward_gt, former_backward_gt = process_optical_flow(flownet, next_gt_image, gt_image, H, W, H, W)
+        #         flow_2d_gt = flownet(gt_image[None,:3]*255, next_gt_image[None,:3]*255) # return flow_predictions, feat_s, feat_t
+        #         flow_2d_pred = flownet(image[None,:3]*255, next_gt_image[None,:3]*255)
             
-                H_flow, W_flow = flow_2d_gt[0].shape[-2:]
-                if W_flow == W and H_flow == H:
-                    flow_2d_gt = flow_2d_gt[0].squeeze() # 2 H W
-                else: 
-                    flow_2d_gt = torch.nn.functional.interpolate(flow_2d_gt[0], size=(H, W), mode="bilinear").squeeze()
-                    # scale flow for new image size
-                    flow_2d_gt[0] *= W / W_flow
-                    flow_2d_gt[1] *= H / H_flow
+        #         H_flow, W_flow = flow_2d_gt[0].shape[-2:]
+        #         if W_flow == W and H_flow == H:
+        #             flow_2d_gt = flow_2d_gt[0].squeeze() # 2 H W
+        #         else: 
+        #             flow_2d_gt = torch.nn.functional.interpolate(flow_2d_gt[0], size=(H, W), mode="bilinear").squeeze()
+        #             # scale flow for new image size
+        #             flow_2d_gt[0] *= W / W_flow
+        #             flow_2d_gt[1] *= H / H_flow
+                
+        #         H_flow_pred, W_flow_pred = flow_2d_pred[0].shape[-2:]
+        #         if W_flow_pred == W and H_flow_pred == H:
+        #             flow_2d_pred = flow_2d_pred[0].squeeze() # 2 H W
+        #         else: 
+        #             flow_2d_pred = torch.nn.functional.interpolate(flow_2d_pred[0], size=(H, W), mode="bilinear").squeeze()
+        #             # scale flow for new image size
+        #             flow_2d_pred[0] *= W / W_flow_pred
+        #             flow_2d_pred[1] *= H / H_flow_pred
 
-            motion_flow = flow_2d_gt
-            Lflow = flow_loss(gs_flow, motion_flow.detach(), H, W)
-            loss += opt.flow_loss_weight * Lflow
+        #     Lflow = flow_loss(flow_2d_pred, flow_2d_gt, H, W)
+        #     loss += opt.flow_loss_weight * Lflow
+        
+
+        loss += Ll1
+        if stage == "fine" and hyper.time_smoothness_weight != 0:
+            # tv_loss = 0
+            tv_loss = gaussians.compute_regulation(hyper.time_smoothness_weight, hyper.l1_time_planes, hyper.plane_tv_weight)
+            loss += tv_loss
+        if opt.lambda_dssim != 0:
+            ssim_loss = ssim(image_tensor,gt_image_tensor)
+            loss += opt.lambda_dssim * (1.0-ssim_loss)
+        # if opt.lambda_lpips !=0:
+        #     lpipsloss = lpips_loss(image_tensor,gt_image_tensor,lpips_model)
+        #     loss += opt.lambda_lpips * lpipsloss
         
         loss.backward()
         if torch.isnan(loss).any():
@@ -374,7 +289,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
 
             # Log and save
             timer.pause()
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render_helper, [pipe, background], stage, scene.dataset_type)
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, [pipe, background], stage, scene.dataset_type)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration, stage)
@@ -411,18 +326,17 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                     gaussians.prune(densify_threshold, opacity_threshold, scene.cameras_extent, size_threshold)
                     
                 # if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 :
+                if iteration % opt.densification_interval == 0 and gaussians.get_xyz.shape[0]<360000 and opt.add_point:
+                    gaussians.grow(5,5,scene.model_path,iteration,stage)
+                    # torch.cuda.empty_cache()
                 if iteration % opt.opacity_reset_interval == 0:
                     print("reset opacity")
                     gaussians.reset_opacity()
-
+                    
+            
 
             # Optimizer step
             if iteration < opt.iterations:
-                # Clip gradients to prevent NaN
-                all_params = []
-                for group in gaussians.optimizer.param_groups:
-                    all_params.extend(group['params'])
-                torch.nn.utils.clip_grad_norm_(all_params, 1.0)
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
 
@@ -472,6 +386,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
         tb_writer.add_scalar(f'{stage}/train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar(f'{stage}/train_loss_patchestotal_loss', loss.item(), iteration)
         tb_writer.add_scalar(f'{stage}/iter_time', elapsed, iteration)
+        
     
     # Report test and samples of training set
     if iteration in testing_iterations:
